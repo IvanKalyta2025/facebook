@@ -74,14 +74,21 @@ body {
   gap: 10px;
 }
 
-section {
-  display: flex; /* позволяет расположить дочерние <article> в ряд */
+/* section {
+  display: flex;
   border: 1px solid red;
   margin-right: 35%;
-  gap: 50px; /* расстояние между ними */
+  gap: 50px;
   padding: 24px;
   margin-top: 80px;
+} */
+
+section {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
 }
+
 
 .photo-article:nth-child(1),
 .photo-article:nth-child(2) {
