@@ -23,11 +23,12 @@ html,body {
 
 .facebook-logo {
   position: absolute;
-  left: 10px; /* отступ слева */
-  top: 50%; /* центр по вертикали */
-  transform: translateY(-50%); /* точный центр */
-  height: 75px; /* размер логотипа */
+  left: 10px; 
+  top: 50%;
+  transform: translateY(-50%);
+  height: 75px;
 }
+
 #sidebar {
   margin-top: 10px;
   position: absolute;
@@ -82,22 +83,22 @@ html,body {
 */
 section {
   display: grid;
-  grid-template-columns: 1fr 1fr; /* 2 колонки */
-  grid-template-rows: 1fr 1fr;   /* 2 строки */
+  grid-template-columns: 1fr 1fr; 
+  grid-template-rows: 1fr 1fr; 
   margin: 40px 30% 0 0;
   width: 60%;
   height: 80vh;
-  border: 2px solid #ccc; /* видно сетку */
+  border: 2px solid #ccc; 
 }
 
-/* общий стиль фото-блоков */
+
 .photo-article {
   display: flex;
   align-items: center;
   gap: 20px;
 }
 
-/* мужчина: верхний левый угол */
+
 .photo-article:nth-child(1) {
   grid-column: 1;
   grid-row: 1;
@@ -105,7 +106,6 @@ section {
   flex-direction: row;
 }
 
-/* женщина: нижний правый угол */
 .photo-article:nth-child(2) {
   grid-column: 2;
   grid-row: 2;
