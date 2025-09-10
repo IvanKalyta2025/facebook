@@ -102,6 +102,7 @@ section {
   grid-column: 1;
   grid-row: 1;
   justify-content: flex-start;
+  flex-direction: row;
 }
 
 /* женщина: нижний правый угол */
@@ -109,6 +110,7 @@ section {
   grid-column: 2;
   grid-row: 2;
   justify-content: flex-end;
+  flex-direction: row-reverse;
 }
 
 .photo-article img {
