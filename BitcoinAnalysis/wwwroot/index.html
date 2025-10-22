@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bitcoin Strategy Dashboard</title>
+    <link rel="stylesheet" href="styles/main.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>Bitcoin Strategy Dashboard</h1>
+      <p class="subtitle">
+        Мониторинг анализа BTC, тестового счёта и рекомендаций DeepSeek
+      </p>
+    </header>
+    <main class="layout">
+      <section class="card controls">
+        <h2>Запустить анализ</h2>
+        <form id="analysis-form" autocomplete="off">
+          <label class="control">
+            Таймфрейм
+            <select id="timeframe-select" name="timeframe"></select>
+          </label>
+          <label class="control">
+            Количество свечей
+            <input
+              type="number"
+              id="limit-input"
+              name="limit"
+              min="50"
+              max="500"
+              step="10"
+            />
+          </label>
+          <button type="submit" id="analyze-button">Обновить данные</button>
+        </form>
+        <div id="form-status" class="status-message"></div>
+      </section>
+
+      <section class="card summary">
+        <h2>Последняя рекомендация</h2>
+        <div id="summary-content" class="content-block muted">
+          Запустите анализ, чтобы увидеть агрегированные сигналы по биржам.
+        </div>
+      </section>
+
+      <section class="card portfolio">
+        <h2>Портфель</h2>
+        <div id="portfolio-content" class="content-block muted">
+          История сделок появится после первого анализа.
+        </div>
+      </section>
+
+      <section class="card history">
+        <h2>История сделок</h2>
+        <div class="table-wrapper">
+          <table id="history-table">
+            <thead>
+              <tr>
+                <th>Открыта</th>
+                <th>Закрыта</th>
+                <th>Направление</th>
+                <th>Вход</th>
+                <th>Выход</th>
+                <th>ROI</th>
+                <th>PnL (USD)</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card ai-block">
+        <h2>Советник DeepSeek</h2>
+        <div id="ai-content" class="content-block muted">
+          Совет будет показан после успешного запроса к DeepSeek.
+        </div>
+      </section>
+    </main>
+
+    <template id="exchange-template">
+      <article class="exchange-card">
+        <header>
+          <h3 class="exchange-name"></h3>
+          <span class="exchange-score"></span>
+        </header>
+        <ul class="exchange-metrics"></ul>
+        <p class="exchange-candles"></p>
+      </article>
+    </template>
+
+    <script src="scripts/app.js" type="module"></script>
+  </body>
+</html>
