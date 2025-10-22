@@ -2,3 +2,7 @@ bin/
 obj/
 **/bin/
 **/obj/
+*.db
+*.db-shm
+*.db-wal
+trading_performance.json

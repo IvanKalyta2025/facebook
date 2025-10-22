@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -10,12 +11,13 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 
 namespace BitcoinAnalysis;
 
 internal static class Program
 {
-    private const int DefaultLimit = 200;
+    internal const int DefaultLimit = 200;
     private const string UserAgent = "Mozilla/5.0 (compatible; BitcoinAnalysisBot/1.0)";
 
     private static readonly Dictionary<string, TimeframeOption> Timeframes = new(StringComparer.OrdinalIgnoreCase)
@@ -24,6 +26,23 @@ internal static class Program
         ["4h"] = new TimeframeOption("4 часа", "14400", "4h", "4H", "240"),
         ["1d"] = new TimeframeOption("1 день", "86400", "1d", "1D", "D"),
     };
+
+    private static readonly (string Name, Func<HttpClient, int, string, Task<List<Candle>>> Fetch)[] Fetchers =
+    {
+        ("Coinbase", ExchangeClient.FetchCoinbaseAsync),
+        ("Binance", ExchangeClient.FetchBinanceAsync),
+        ("OKX", ExchangeClient.FetchOkxAsync),
+        ("Bybit", ExchangeClient.FetchBybitAsync),
+    };
+
+    internal static IReadOnlyDictionary<string, TimeframeOption> AvailableTimeframes => Timeframes;
+
+    internal static IEnumerable<(string Name, Func<HttpClient, int, string, Task<List<Candle>>> Fetch)> ExchangeFetchers => Fetchers;
+
+    internal static bool TryGetTimeframe(string key, out TimeframeOption option)
+    {
+        return Timeframes.TryGetValue(key, out option);
+    }
 
     public static async Task<int> Main(string[] args)
     {
@@ -35,6 +54,8 @@ internal static class Program
 
         var timeframeKey = "1h";
         var limit = DefaultLimit;
+        var serve = false;
+        var port = 8080;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -57,6 +78,18 @@ internal static class Program
                     return 1;
                 }
             }
+            else if (string.Equals(argument, "--serve", StringComparison.OrdinalIgnoreCase))
+            {
+                serve = true;
+            }
+            else if (string.Equals(argument, "--port", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= args.Length || !int.TryParse(args[++i], NumberStyles.Integer, CultureInfo.InvariantCulture, out port))
+                {
+                    Console.Error.WriteLine("Для аргумента --port необходимо указать номер порта.");
+                    return 1;
+                }
+            }
             else if (argument.StartsWith("-"))
             {
                 Console.Error.WriteLine($"Неизвестный аргумент: {argument}");
@@ -65,7 +98,7 @@ internal static class Program
             }
         }
 
-        if (!Timeframes.TryGetValue(timeframeKey, out var timeframeConfig))
+        if (!TryGetTimeframe(timeframeKey, out var timeframeConfig))
         {
             Console.Error.WriteLine($"Неподдерживаемый таймфрейм: {timeframeKey}");
             PrintHelp();
@@ -74,31 +107,181 @@ internal static class Program
 
         limit = Math.Max(50, limit);
 
-        using var httpClient = new HttpClient
+        var databasePath = Path.Combine(AppContext.BaseDirectory, "trading_performance.db");
+        var tracker = new PerformanceTracker(databasePath, initialBalance: 10_000.0, leverage: 10.0);
+        var deepSeekKey = Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY");
+        var analysisService = new AnalysisService(tracker, deepSeekKey);
+
+        if (serve)
+        {
+            using var server = new TradingServer(analysisService, port, timeframeKey, limit);
+            using var cts = new CancellationTokenSource();
+
+            Console.CancelKeyPress += (_, eventArgs) =>
+            {
+                eventArgs.Cancel = true;
+                cts.Cancel();
+            };
+
+            await server.RunAsync(cts.Token).ConfigureAwait(false);
+            return 0;
+        }
+
+        using var httpClient = CreateHttpClient();
+
+        AnalysisSummary summary;
+        try
+        {
+            summary = await analysisService.RunAsync(httpClient, timeframeKey, limit, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (ArgumentException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            PrintHelp();
+            return 1;
+        }
+
+        PrintConsoleReport(summary, tracker);
+        return 0;
+    }
+
+    internal static HttpClient CreateHttpClient()
+    {
+        var httpClient = new HttpClient
         {
             Timeout = TimeSpan.FromSeconds(20),
         };
+
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgent);
         httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        return httpClient;
+    }
 
-        var fetchers = new (string Name, Func<HttpClient, int, string, Task<List<Candle>>> Fetch)[]
+    private static void PrintConsoleReport(AnalysisSummary summary, PerformanceTracker tracker)
+    {
+        Console.WriteLine(
+            $"Анализ BTC/USD для таймфрейма {summary.TimeframeLabel} (последние {summary.Limit} свечей):\n");
+
+        if (summary.Exchanges.Count > 0)
         {
-            ("Coinbase", ExchangeClient.FetchCoinbaseAsync),
-            ("Binance", ExchangeClient.FetchBinanceAsync),
-            ("OKX", ExchangeClient.FetchOkxAsync),
-            ("Bybit", ExchangeClient.FetchBybitAsync),
-        };
+            foreach (var result in summary.Exchanges)
+            {
+                Console.WriteLine(ExchangeReporter.DescribeResult(result));
+                Console.WriteLine(new string('-', 80));
+            }
+
+            if (summary.Aggregate != null)
+            {
+                Console.WriteLine($"Средний балл по биржам: {summary.Aggregate.AverageScore:F2}");
+                Console.WriteLine($"Рекомендация: {summary.Aggregate.Suggestion}");
+            }
+
+            if (summary.ClosedTrade != null)
+            {
+                var direction = TradeBiasExtensions.ToRussian(summary.ClosedTrade.Bias);
+                var sign = summary.ClosedTrade.ProfitLoss >= 0 ? "+" : string.Empty;
+                Console.WriteLine(
+                    $"Закрыта позиция {direction} от {summary.ClosedTrade.OpenedAt:O}: {sign}{summary.ClosedTrade.ProfitLoss:F2} USD (ROI {summary.ClosedTrade.ReturnOnMargin * 100:F2}%).");
+            }
+
+            if (summary.OpenedPosition != null)
+            {
+                Console.WriteLine(
+                    $"Открыта новая позиция {TradeBiasExtensions.ToRussian(summary.OpenedPosition.Bias)} по {summary.OpenedPosition.EntryPrice:F2} USD. Маржа {summary.OpenedPosition.Margin:F2} USD, объём {summary.OpenedPosition.Quantity:F6} BTC при плече {summary.OpenedPosition.Leverage:F1}x.");
+            }
+            else if (summary.Aggregate?.Bias != TradeBias.Neutral)
+            {
+                Console.WriteLine("Недостаточно средств для открытия новой позиции в тестовом портфеле.");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("Сводка тестового счёта:");
+            Console.WriteLine(tracker.DescribeState(summary.Portfolio, summary.AverageClosePrice));
+
+            if (summary.AiRecommendation != null)
+            {
+                Console.WriteLine();
+                Console.WriteLine($"AI советник ({summary.AiRecommendation.Provider}):");
+                Console.WriteLine(summary.AiRecommendation.Message);
+            }
+            else if (!string.IsNullOrWhiteSpace(summary.AiStatus))
+            {
+                Console.WriteLine();
+                Console.WriteLine(summary.AiStatus);
+            }
+        }
+        else
+        {
+            Console.WriteLine("Не удалось получить данные ни от одной из бирж.");
+        }
+
+        if (summary.Errors.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Возникшие ошибки:");
+            foreach (var message in summary.Errors)
+            {
+                Console.WriteLine($"  - {message}");
+            }
+        }
+    }
+
+    private static void PrintHelp()
+    {
+        Console.WriteLine("Использование: dotnet run -- [--timeframe <1h|4h|1d>] [--limit <число>] [--serve] [--port <номер>]");
+        Console.WriteLine();
+        Console.WriteLine("Опции:");
+        Console.WriteLine("  --timeframe    Таймфрейм свечей (1h, 4h, 1d). По умолчанию 1h.");
+        Console.WriteLine("  --limit        Количество свечей для загрузки. Минимум 50. По умолчанию 200.");
+        Console.WriteLine("  --serve        Запустить локальный веб-сервер с панелью мониторинга.");
+        Console.WriteLine("  --port         Порт для веб-сервера (по умолчанию 8080).");
+        Console.WriteLine();
+        Console.WriteLine("Переменные окружения:");
+        Console.WriteLine("  DEEPSEEK_API_KEY  Токен для обращения к AI DeepSeek (опционально).");
+        Console.WriteLine();
+        Console.WriteLine(
+            "Примечание: программа ведёт учёт тестового баланса с плечом 10x в базе trading_performance.db, обновляет статистику сделок и может предоставлять веб-интерфейс для просмотра.");
+    }
+}
+
+internal sealed class AnalysisService
+{
+    private readonly PerformanceTracker _tracker;
+    private readonly string? _deepSeekKey;
+    private readonly SemaphoreSlim _stateLock = new(1, 1);
+
+    public AnalysisService(PerformanceTracker tracker, string? deepSeekKey)
+    {
+        _tracker = tracker;
+        _deepSeekKey = deepSeekKey;
+    }
+
+    public async Task<AnalysisSummary> RunAsync(HttpClient httpClient, string timeframeKey, int limit, CancellationToken cancellationToken)
+    {
+        if (!Program.TryGetTimeframe(timeframeKey, out var timeframeOption))
+        {
+            throw new ArgumentException($"Неподдерживаемый таймфрейм: {timeframeKey}", nameof(timeframeKey));
+        }
+
+        var sanitizedLimit = Math.Max(50, limit);
 
         var results = new List<ExchangeResult>();
         var errors = new List<string>();
 
-        foreach (var (name, fetch) in fetchers)
+        foreach (var (name, fetch) in Program.ExchangeFetchers)
         {
             try
             {
-                var timeframeValue = timeframeConfig.ForExchange(name);
-                var candles = await fetch(httpClient, limit, timeframeValue).ConfigureAwait(false);
-                results.Add(ExchangeAnalyzer.AnalyseExchange(name, candles));
+                var timeframeValue = timeframeOption.ForExchange(name);
+                var candles = await fetch(httpClient, sanitizedLimit, timeframeValue).ConfigureAwait(false);
+                if (candles.Count > 0)
+                {
+                    results.Add(ExchangeAnalyzer.AnalyseExchange(name, candles));
+                }
+                else
+                {
+                    errors.Add($"{name}: нет данных для анализа.");
+                }
             }
             catch (ExchangeFetchException ex)
             {
@@ -110,127 +293,482 @@ internal static class Program
             }
         }
 
-        Console.WriteLine($"Анализ BTC/USD для таймфрейма {timeframeConfig.Label} (последние {limit} свечей):\n");
-
-        if (results.Count > 0)
+        var summary = new AnalysisSummary
         {
-            foreach (var result in results)
-            {
-                Console.WriteLine(ExchangeReporter.DescribeResult(result));
-                Console.WriteLine(new string('-', 80));
-            }
+            TimeframeKey = timeframeKey,
+            TimeframeLabel = timeframeOption.Label,
+            Limit = sanitizedLimit,
+            Errors = errors,
+        };
+        summary.Exchanges.AddRange(results);
 
-            var aggregateSuggestion = ExchangeAnalyzer.AggregateSuggestion(results);
-            Console.WriteLine($"Средний балл по биржам: {aggregateSuggestion.AverageScore:F2}");
-            Console.WriteLine($"Рекомендация: {aggregateSuggestion.Suggestion}");
+        if (results.Count == 0)
+        {
+            summary.Portfolio = await LoadPortfolioAsync(cancellationToken).ConfigureAwait(false);
+            return summary;
+        }
 
-            var latestTimestamp = results.Max(result => result.Candles[^1].Timestamp);
-            var averageClosePrice = results.Average(result => result.Candles[^1].Close);
+        var aggregate = ExchangeAnalyzer.AggregateSuggestion(results);
+        var latestTimestamp = results.Max(r => r.Candles[^1].Timestamp);
+        var averageClosePrice = results.Average(r => r.Candles[^1].Close);
 
-            var tracker = new PerformanceTracker(
-                Path.Combine(AppContext.BaseDirectory, "trading_performance.json"),
-                initialBalance: 10_000.0,
-                leverage: 10.0);
+        PortfolioState portfolioCopy;
+        TradeRecord? closedTrade;
+        SimulatedPosition? openedPosition;
 
-            var portfolioState = tracker.Load();
-            var closedTrade = tracker.CloseOpenPosition(portfolioState, averageClosePrice, latestTimestamp);
-            if (closedTrade != null)
-            {
-                var direction = TradeBiasExtensions.ToRussian(closedTrade.Bias);
-                var sign = closedTrade.ProfitLoss >= 0 ? "+" : string.Empty;
-                Console.WriteLine(
-                    $"Закрыта позиция {direction} от {closedTrade.OpenedAt:O}: {sign}{closedTrade.ProfitLoss:F2} USD (ROI {closedTrade.ReturnOnMargin * 100:F2}%).");
-            }
-
-            var openedPosition = tracker.OpenPosition(
-                portfolioState,
-                aggregateSuggestion.Bias,
+        await _stateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var workingState = _tracker.Load();
+            closedTrade = _tracker.CloseOpenPosition(workingState, averageClosePrice, latestTimestamp);
+            _tracker.OpenPosition(
+                workingState,
+                aggregate.Bias,
                 averageClosePrice,
                 latestTimestamp,
-                aggregateSuggestion.Suggestion);
+                aggregate.Suggestion);
+            _tracker.Save(workingState);
+            portfolioCopy = workingState.DeepCopy();
+            openedPosition = portfolioCopy.OpenPosition;
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
 
-            if (openedPosition != null)
+        summary.Aggregate = aggregate;
+        summary.Portfolio = portfolioCopy;
+        summary.ClosedTrade = closedTrade;
+        summary.OpenedPosition = openedPosition;
+        summary.AverageClosePrice = averageClosePrice;
+        summary.LatestTimestamp = latestTimestamp;
+
+        if (string.IsNullOrWhiteSpace(_deepSeekKey))
+        {
+            summary.AiStatus = "AI советник DeepSeek: переменная окружения DEEPSEEK_API_KEY не задана.";
+            return summary;
+        }
+
+        try
+        {
+            using var advisorClient = DeepSeekAdvisor.CreateHttpClient(_deepSeekKey);
+            var advisor = new DeepSeekAdvisor(advisorClient);
+            var prompt = AiPromptBuilder.BuildPrompt(
+                timeframeKey,
+                timeframeOption,
+                results,
+                aggregate,
+                portfolioCopy,
+                closedTrade,
+                openedPosition,
+                averageClosePrice);
+            var recommendation = await advisor.TryGetRecommendationAsync(prompt, cancellationToken).ConfigureAwait(false);
+            if (recommendation != null)
             {
-                Console.WriteLine(
-                    $"Открыта новая позиция {TradeBiasExtensions.ToRussian(openedPosition.Bias)} по {openedPosition.EntryPrice:F2} USD. Маржа {openedPosition.Margin:F2} USD, объём {openedPosition.Quantity:F6} BTC при плече {openedPosition.Leverage:F1}x.");
-            }
-            else if (aggregateSuggestion.Bias != TradeBias.Neutral)
-            {
-                Console.WriteLine("Недостаточно средств для открытия новой позиции в тестовом портфеле.");
-            }
-
-            tracker.Save(portfolioState);
-
-            Console.WriteLine();
-            Console.WriteLine("Сводка тестового счёта:");
-            Console.WriteLine(tracker.DescribeState(portfolioState, averageClosePrice));
-
-            var deepSeekKey = Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY");
-            if (string.IsNullOrWhiteSpace(deepSeekKey))
-            {
-                Console.WriteLine();
-                Console.WriteLine("AI советник DeepSeek: переменная окружения DEEPSEEK_API_KEY не задана.");
+                summary.AiRecommendation = recommendation;
             }
             else
             {
-                try
-                {
-                    using var deepSeekClient = DeepSeekAdvisor.CreateHttpClient(deepSeekKey);
-                    var advisor = new DeepSeekAdvisor(deepSeekClient);
-                    var prompt = AiPromptBuilder.BuildPrompt(
-                        timeframeKey,
-                        timeframeConfig,
-                        results,
-                        aggregateSuggestion,
-                        portfolioState,
-                        closedTrade,
-                        openedPosition,
-                        averageClosePrice);
-                    var recommendation = await advisor.TryGetRecommendationAsync(prompt).ConfigureAwait(false);
-                    if (recommendation != null)
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine($"AI советник ({recommendation.Provider}):");
-                        Console.WriteLine(recommendation.Message);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine();
-                    Console.WriteLine($"AI советник DeepSeek не ответил: {ex.Message}");
-                }
+                summary.AiStatus = "AI советник DeepSeek: ответ не содержит рекомендаций.";
             }
         }
-        else
+        catch (Exception ex)
         {
-            Console.WriteLine("Не удалось получить данные ни от одной из бирж.");
+            summary.AiStatus = $"AI советник DeepSeek не ответил: {ex.Message}";
         }
 
-        if (errors.Count > 0)
-        {
-            Console.WriteLine();
-            Console.WriteLine("Возникшие ошибки:");
-            foreach (var message in errors)
-            {
-                Console.WriteLine($"  - {message}");
-            }
-        }
-
-        return 0;
+        return summary;
     }
 
-    private static void PrintHelp()
+    public async Task<PortfolioState> LoadPortfolioAsync(CancellationToken cancellationToken)
     {
-        Console.WriteLine("Использование: dotnet run -- [--timeframe <1h|4h|1d>] [--limit <число>]");
-        Console.WriteLine();
-        Console.WriteLine("Опции:");
-        Console.WriteLine("  --timeframe    Таймфрейм свечей (1h, 4h, 1d). По умолчанию 1h.");
-        Console.WriteLine("  --limit        Количество свечей для загрузки. Минимум 50. По умолчанию 200.");
-        Console.WriteLine();
-        Console.WriteLine("Переменные окружения:");
-        Console.WriteLine("  DEEPSEEK_API_KEY  Токен для обращения к AI DeepSeek (опционально).");
-        Console.WriteLine();
-        Console.WriteLine("Примечание: программа ведёт учёт тестового баланса с плечом 10x в файле trading_performance.json и обновляет статистику сделок при каждом запуске.");
+        await _stateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return _tracker.Load().DeepCopy();
+        }
+        finally
+        {
+            _stateLock.Release();
+        }
+    }
+}
+
+internal sealed class AnalysisSummary
+{
+    public string TimeframeKey { get; set; } = string.Empty;
+
+    public string TimeframeLabel { get; set; } = string.Empty;
+
+    public int Limit { get; set; }
+
+    public List<ExchangeResult> Exchanges { get; } = new();
+
+    public AggregateSuggestionResult? Aggregate { get; set; }
+
+    public PortfolioState Portfolio { get; set; } = new();
+
+    public TradeRecord? ClosedTrade { get; set; }
+
+    public SimulatedPosition? OpenedPosition { get; set; }
+
+    public double? AverageClosePrice { get; set; }
+
+    public DateTime? LatestTimestamp { get; set; }
+
+    public AiRecommendation? AiRecommendation { get; set; }
+
+    public string? AiStatus { get; set; }
+
+    public List<string> Errors { get; set; } = new();
+}
+
+internal sealed class AnalysisRequest
+{
+    public string? Timeframe { get; set; }
+
+    public int? Limit { get; set; }
+}
+
+internal sealed class TradingServer : IDisposable
+{
+    private readonly AnalysisService _service;
+    private readonly int _port;
+    private readonly string _defaultTimeframe;
+    private readonly int _defaultLimit;
+    private readonly HttpListener _listener = new();
+    private readonly HttpClient _httpClient;
+    private readonly JsonSerializerOptions _jsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter() },
+    };
+    private readonly string _staticRoot;
+    private AnalysisSummary? _lastSummary;
+    private bool _disposed;
+
+    public TradingServer(AnalysisService service, int port, string defaultTimeframe, int defaultLimit)
+    {
+        _service = service;
+        _port = port;
+        _defaultTimeframe = defaultTimeframe;
+        _defaultLimit = Math.Max(50, defaultLimit);
+        _httpClient = Program.CreateHttpClient();
+        _staticRoot = Path.Combine(AppContext.BaseDirectory, "wwwroot");
+        _listener.Prefixes.Add($"http://127.0.0.1:{_port}/");
+        _listener.Prefixes.Add($"http://localhost:{_port}/");
+    }
+
+    public async Task RunAsync(CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(_staticRoot);
+
+        try
+        {
+            _lastSummary = await _service.RunAsync(_httpClient, _defaultTimeframe, _defaultLimit, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Не удалось выполнить начальный анализ: {ex.Message}");
+        }
+
+        cancellationToken.Register(() =>
+        {
+            try
+            {
+                _listener.Stop();
+            }
+            catch
+            {
+            }
+        });
+
+        _listener.Start();
+        Console.WriteLine($"Веб-интерфейс запущен: http://localhost:{_port}/ (Ctrl+C для остановки)");
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            HttpListenerContext context;
+            try
+            {
+                context = await _listener.GetContextAsync().ConfigureAwait(false);
+            }
+            catch (HttpListenerException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            await ProcessRequestAsync(context, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _listener.Close();
+        _httpClient.Dispose();
+    }
+
+    private async Task ProcessRequestAsync(HttpListenerContext context, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var request = context.Request;
+            var path = request.Url?.AbsolutePath ?? "/";
+
+            if (string.Equals(request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.Equals(path, "/", StringComparison.OrdinalIgnoreCase) || string.Equals(path, "/index.html", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ServeStaticAsync(context.Response, "index.html", "text/html; charset=utf-8", cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                if (path.StartsWith("/styles/", StringComparison.OrdinalIgnoreCase) || path.StartsWith("/scripts/", StringComparison.OrdinalIgnoreCase))
+                {
+                    var relative = path.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
+                    await ServeStaticAsync(context.Response, relative, GetContentType(relative), cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                if (string.Equals(path, "/api/dashboard", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ServeDashboardAsync(context.Response, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                if (string.Equals(path, "/api/summary", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ServeSummaryAsync(context.Response, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                context.Response.Close();
+                return;
+            }
+
+            if (string.Equals(request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase) && string.Equals(path, "/api/analyze", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleAnalyzeAsync(context, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+            context.Response.Close();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при обработке запроса: {ex.Message}");
+            try
+            {
+                await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.InternalServerError, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                try
+                {
+                    context.Response.Abort();
+                }
+                catch
+                {
+                }
+            }
+        }
+    }
+
+    private async Task ServeDashboardAsync(HttpListenerResponse response, CancellationToken cancellationToken)
+    {
+        var portfolio = await _service.LoadPortfolioAsync(cancellationToken).ConfigureAwait(false);
+        var timeframes = new List<TimeframeDescriptor>();
+        foreach (var pair in Program.AvailableTimeframes)
+        {
+            timeframes.Add(new TimeframeDescriptor(pair.Key, pair.Value.Label));
+        }
+
+        var payload = new DashboardResponse
+        {
+            Portfolio = portfolio,
+            LastSummary = _lastSummary,
+            Timeframes = timeframes,
+            DefaultLimit = _defaultLimit,
+            DefaultTimeframe = _lastSummary?.TimeframeKey ?? _defaultTimeframe,
+        };
+
+        await WriteJsonAsync(response, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task ServeSummaryAsync(HttpListenerResponse response, CancellationToken cancellationToken)
+    {
+        await WriteJsonAsync(response, _lastSummary ?? new { message = "Нет актуального анализа." }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task HandleAnalyzeAsync(HttpListenerContext context, CancellationToken cancellationToken)
+    {
+        AnalysisRequest? requestPayload = null;
+        if (context.Request.HasEntityBody)
+        {
+            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+            var body = await reader.ReadToEndAsync().ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(body))
+            {
+                requestPayload = JsonSerializer.Deserialize<AnalysisRequest>(body, _jsonOptions);
+            }
+        }
+
+        var timeframe = !string.IsNullOrWhiteSpace(requestPayload?.Timeframe) ? requestPayload!.Timeframe! : _defaultTimeframe;
+        var limit = requestPayload?.Limit ?? _defaultLimit;
+
+        try
+        {
+            var summary = await _service.RunAsync(_httpClient, timeframe, limit, cancellationToken).ConfigureAwait(false);
+            _lastSummary = summary;
+            await WriteJsonAsync(context.Response, summary, cancellationToken).ConfigureAwait(false);
+        }
+        catch (ArgumentException ex)
+        {
+            await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.InternalServerError, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task ServeStaticAsync(HttpListenerResponse response, string relativePath, string contentType, CancellationToken cancellationToken)
+    {
+        var safePath = relativePath.Replace('/', Path.DirectorySeparatorChar);
+        var filePath = Path.Combine(_staticRoot, safePath);
+        if (!File.Exists(filePath))
+        {
+            response.StatusCode = (int)HttpStatusCode.NotFound;
+            response.Close();
+            return;
+        }
+
+        response.StatusCode = (int)HttpStatusCode.OK;
+        response.ContentType = contentType;
+        await using var fileStream = File.OpenRead(filePath);
+        response.ContentLength64 = fileStream.Length;
+        await fileStream.CopyToAsync(response.OutputStream, cancellationToken).ConfigureAwait(false);
+        response.Close();
+    }
+
+    private static string GetContentType(string relative)
+    {
+        if (relative.EndsWith(".css", StringComparison.OrdinalIgnoreCase))
+        {
+            return "text/css; charset=utf-8";
+        }
+
+        if (relative.EndsWith(".js", StringComparison.OrdinalIgnoreCase))
+        {
+            return "application/javascript; charset=utf-8";
+        }
+
+        return "text/plain; charset=utf-8";
+    }
+
+    private Task WriteJsonAsync(HttpListenerResponse response, object payload, CancellationToken cancellationToken)
+    {
+        return WriteJsonAsync(response, payload, HttpStatusCode.OK, cancellationToken);
+    }
+
+    private async Task WriteJsonAsync(HttpListenerResponse response, object payload, HttpStatusCode statusCode, CancellationToken cancellationToken)
+    {
+        var json = JsonSerializer.Serialize(payload, _jsonOptions);
+        var buffer = Encoding.UTF8.GetBytes(json);
+        response.StatusCode = (int)statusCode;
+        response.ContentType = "application/json; charset=utf-8";
+        response.ContentLength64 = buffer.Length;
+        await response.OutputStream.WriteAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false);
+        response.Close();
+    }
+
+    private sealed record TimeframeDescriptor(string Key, string Label);
+
+    private sealed class DashboardResponse
+    {
+        public PortfolioState Portfolio { get; set; } = new();
+
+        public AnalysisSummary? LastSummary { get; set; }
+
+        public List<TimeframeDescriptor> Timeframes { get; set; } = new();
+
+        public int DefaultLimit { get; set; }
+
+        public string DefaultTimeframe { get; set; } = string.Empty;
+    }
+}
+
+internal static class PortfolioStateExtensions
+{
+    public static PortfolioState DeepCopy(this PortfolioState source)
+    {
+        var copy = new PortfolioState
+        {
+            InitialBalance = source.InitialBalance,
+            Balance = source.Balance,
+            Leverage = source.Leverage,
+            Statistics = new PerformanceStatistics
+            {
+                RealizedPnl = source.Statistics?.RealizedPnl ?? 0.0,
+                TradesWon = source.Statistics?.TradesWon ?? 0,
+                TradesLost = source.Statistics?.TradesLost ?? 0,
+                TradesTotal = source.Statistics?.TradesTotal ?? 0,
+                BiggestWin = source.Statistics?.BiggestWin ?? 0.0,
+                BiggestLoss = source.Statistics?.BiggestLoss ?? 0.0,
+            },
+            History = new List<TradeRecord>(),
+        };
+
+        if (source.OpenPosition != null)
+        {
+            copy.OpenPosition = new SimulatedPosition
+            {
+                Bias = source.OpenPosition.Bias,
+                EntryPrice = source.OpenPosition.EntryPrice,
+                Quantity = source.OpenPosition.Quantity,
+                Margin = source.OpenPosition.Margin,
+                Leverage = source.OpenPosition.Leverage,
+                OpenedAt = source.OpenPosition.OpenedAt,
+                Rationale = source.OpenPosition.Rationale,
+            };
+        }
+
+        if (source.History != null)
+        {
+            foreach (var trade in source.History)
+            {
+                copy.History.Add(new TradeRecord
+                {
+                    OpenedAt = trade.OpenedAt,
+                    ClosedAt = trade.ClosedAt,
+                    Bias = trade.Bias,
+                    EntryPrice = trade.EntryPrice,
+                    ExitPrice = trade.ExitPrice,
+                    Quantity = trade.Quantity,
+                    Margin = trade.Margin,
+                    ProfitLoss = trade.ProfitLoss,
+                    ReturnOnMargin = trade.ReturnOnMargin,
+                    Liquidated = trade.Liquidated,
+                    Rationale = trade.Rationale,
+                });
+            }
+        }
+
+        return copy;
     }
 }
 
@@ -1199,59 +1737,204 @@ internal sealed class PerformanceStatistics
 
 internal sealed class PerformanceTracker
 {
-    private readonly string _filePath;
+    private const int MaxHistory = 200;
+    private readonly string _databasePath;
+    private readonly string _connectionString;
     private readonly double _initialBalance;
     private readonly double _leverage;
-    private readonly JsonSerializerOptions _serializerOptions = new()
-    {
-        WriteIndented = true,
-        Converters = { new JsonStringEnumConverter() },
-    };
 
-    public PerformanceTracker(string filePath, double initialBalance, double leverage)
+    public PerformanceTracker(string databasePath, double initialBalance, double leverage)
     {
-        _filePath = filePath;
+        _databasePath = databasePath;
+        _connectionString = $"Data Source={_databasePath}";
         _initialBalance = initialBalance;
         _leverage = leverage;
+        InitializeDatabase();
     }
 
     public PortfolioState Load()
     {
-        if (!File.Exists(_filePath))
-        {
-            return CreateFreshState();
-        }
+        using var connection = CreateConnection();
+        connection.Open();
 
-        try
+        var state = new PortfolioState();
+
+        using (var command = connection.CreateCommand())
         {
-            var json = File.ReadAllText(_filePath);
-            var state = JsonSerializer.Deserialize<PortfolioState>(json, _serializerOptions);
-            if (state == null)
+            command.CommandText = "SELECT initial_balance, balance, leverage FROM portfolio_state WHERE id = 1";
+            using var reader = command.ExecuteReader();
+            if (reader.Read())
             {
-                return CreateFreshState();
+                state.InitialBalance = reader.GetDouble(0);
+                state.Balance = reader.GetDouble(1);
+                state.Leverage = reader.GetDouble(2);
             }
+            else
+            {
+                state = CreateFreshState();
+            }
+        }
 
-            NormalizeState(state);
-            return state;
-        }
-        catch (Exception)
+        using (var statsCommand = connection.CreateCommand())
         {
-            return CreateFreshState();
+            statsCommand.CommandText =
+                "SELECT realized_pnl, trades_won, trades_lost, trades_total, biggest_win, biggest_loss FROM statistics WHERE id = 1";
+            using var reader = statsCommand.ExecuteReader();
+            if (reader.Read())
+            {
+                state.Statistics = new PerformanceStatistics
+                {
+                    RealizedPnl = reader.GetDouble(0),
+                    TradesWon = reader.GetInt32(1),
+                    TradesLost = reader.GetInt32(2),
+                    TradesTotal = reader.GetInt32(3),
+                    BiggestWin = reader.GetDouble(4),
+                    BiggestLoss = reader.GetDouble(5),
+                };
+            }
+            else
+            {
+                state.Statistics = new PerformanceStatistics();
+            }
         }
+
+        using (var positionCommand = connection.CreateCommand())
+        {
+            positionCommand.CommandText =
+                "SELECT bias, entry_price, quantity, margin, leverage, opened_at, rationale FROM open_position ORDER BY id DESC LIMIT 1";
+            using var reader = positionCommand.ExecuteReader();
+            if (reader.Read())
+            {
+                state.OpenPosition = new SimulatedPosition
+                {
+                    Bias = (TradeBias)reader.GetInt32(0),
+                    EntryPrice = reader.GetDouble(1),
+                    Quantity = reader.GetDouble(2),
+                    Margin = reader.GetDouble(3),
+                    Leverage = reader.GetDouble(4),
+                    OpenedAt = DateTime.Parse(reader.GetString(5), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    Rationale = reader.IsDBNull(6) ? null : reader.GetString(6),
+                };
+            }
+        }
+
+        var history = new List<TradeRecord>();
+        using (var historyCommand = connection.CreateCommand())
+        {
+            historyCommand.CommandText =
+                "SELECT opened_at, closed_at, bias, entry_price, exit_price, quantity, margin, profit_loss, return_on_margin, liquidated, rationale FROM trades ORDER BY closed_at";
+            using var reader = historyCommand.ExecuteReader();
+            while (reader.Read())
+            {
+                history.Add(new TradeRecord
+                {
+                    OpenedAt = DateTime.Parse(reader.GetString(0), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    ClosedAt = DateTime.Parse(reader.GetString(1), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    Bias = (TradeBias)reader.GetInt32(2),
+                    EntryPrice = reader.GetDouble(3),
+                    ExitPrice = reader.GetDouble(4),
+                    Quantity = reader.GetDouble(5),
+                    Margin = reader.GetDouble(6),
+                    ProfitLoss = reader.GetDouble(7),
+                    ReturnOnMargin = reader.GetDouble(8),
+                    Liquidated = reader.GetInt32(9) != 0,
+                    Rationale = reader.IsDBNull(10) ? null : reader.GetString(10),
+                });
+            }
+        }
+
+        state.History = history;
+        NormalizeState(state);
+        return state;
     }
 
     public void Save(PortfolioState state)
     {
         NormalizeState(state);
 
-        var directory = Path.GetDirectoryName(_filePath);
-        if (!string.IsNullOrEmpty(directory))
+        using var connection = CreateConnection();
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+
+        using (var updateState = connection.CreateCommand())
         {
-            Directory.CreateDirectory(directory);
+            updateState.Transaction = transaction;
+            updateState.CommandText =
+                "UPDATE portfolio_state SET initial_balance=@initial, balance=@balance, leverage=@leverage WHERE id=1";
+            updateState.Parameters.AddWithValue("@initial", state.InitialBalance);
+            updateState.Parameters.AddWithValue("@balance", state.Balance);
+            updateState.Parameters.AddWithValue("@leverage", state.Leverage);
+            updateState.ExecuteNonQuery();
         }
 
-        var json = JsonSerializer.Serialize(state, _serializerOptions);
-        File.WriteAllText(_filePath, json);
+        using (var updateStats = connection.CreateCommand())
+        {
+            updateStats.Transaction = transaction;
+            updateStats.CommandText =
+                "UPDATE statistics SET realized_pnl=@pnl, trades_won=@won, trades_lost=@lost, trades_total=@total, biggest_win=@maxWin, biggest_loss=@maxLoss WHERE id=1";
+            updateStats.Parameters.AddWithValue("@pnl", state.Statistics.RealizedPnl);
+            updateStats.Parameters.AddWithValue("@won", state.Statistics.TradesWon);
+            updateStats.Parameters.AddWithValue("@lost", state.Statistics.TradesLost);
+            updateStats.Parameters.AddWithValue("@total", state.Statistics.TradesTotal);
+            updateStats.Parameters.AddWithValue("@maxWin", state.Statistics.BiggestWin);
+            updateStats.Parameters.AddWithValue("@maxLoss", state.Statistics.BiggestLoss);
+            updateStats.ExecuteNonQuery();
+        }
+
+        using (var clearPosition = connection.CreateCommand())
+        {
+            clearPosition.Transaction = transaction;
+            clearPosition.CommandText = "DELETE FROM open_position";
+            clearPosition.ExecuteNonQuery();
+        }
+
+        if (state.OpenPosition != null)
+        {
+            using var insertPosition = connection.CreateCommand();
+            insertPosition.Transaction = transaction;
+            insertPosition.CommandText =
+                "INSERT INTO open_position (bias, entry_price, quantity, margin, leverage, opened_at, rationale) VALUES (@bias, @entry, @quantity, @margin, @leverage, @opened, @rationale)";
+            insertPosition.Parameters.AddWithValue("@bias", (int)state.OpenPosition.Bias);
+            insertPosition.Parameters.AddWithValue("@entry", state.OpenPosition.EntryPrice);
+            insertPosition.Parameters.AddWithValue("@quantity", state.OpenPosition.Quantity);
+            insertPosition.Parameters.AddWithValue("@margin", state.OpenPosition.Margin);
+            insertPosition.Parameters.AddWithValue("@leverage", state.OpenPosition.Leverage);
+            insertPosition.Parameters.AddWithValue("@opened", state.OpenPosition.OpenedAt.ToString("O", CultureInfo.InvariantCulture));
+            insertPosition.Parameters.AddWithValue("@rationale", (object?)state.OpenPosition.Rationale ?? DBNull.Value);
+            insertPosition.ExecuteNonQuery();
+        }
+
+        using (var clearTrades = connection.CreateCommand())
+        {
+            clearTrades.Transaction = transaction;
+            clearTrades.CommandText = "DELETE FROM trades";
+            clearTrades.ExecuteNonQuery();
+        }
+
+        var history = state.History?.TakeLast(MaxHistory).ToList() ?? new List<TradeRecord>();
+        state.History = history;
+
+        foreach (var trade in history)
+        {
+            using var insertTrade = connection.CreateCommand();
+            insertTrade.Transaction = transaction;
+            insertTrade.CommandText =
+                "INSERT INTO trades (opened_at, closed_at, bias, entry_price, exit_price, quantity, margin, profit_loss, return_on_margin, liquidated, rationale) VALUES (@opened, @closed, @bias, @entry, @exit, @quantity, @margin, @pnl, @rom, @liquidated, @rationale)";
+            insertTrade.Parameters.AddWithValue("@opened", trade.OpenedAt.ToString("O", CultureInfo.InvariantCulture));
+            insertTrade.Parameters.AddWithValue("@closed", trade.ClosedAt.ToString("O", CultureInfo.InvariantCulture));
+            insertTrade.Parameters.AddWithValue("@bias", (int)trade.Bias);
+            insertTrade.Parameters.AddWithValue("@entry", trade.EntryPrice);
+            insertTrade.Parameters.AddWithValue("@exit", trade.ExitPrice);
+            insertTrade.Parameters.AddWithValue("@quantity", trade.Quantity);
+            insertTrade.Parameters.AddWithValue("@margin", trade.Margin);
+            insertTrade.Parameters.AddWithValue("@pnl", trade.ProfitLoss);
+            insertTrade.Parameters.AddWithValue("@rom", trade.ReturnOnMargin);
+            insertTrade.Parameters.AddWithValue("@liquidated", trade.Liquidated ? 1 : 0);
+            insertTrade.Parameters.AddWithValue("@rationale", (object?)trade.Rationale ?? DBNull.Value);
+            insertTrade.ExecuteNonQuery();
+        }
+
+        transaction.Commit();
     }
 
     public TradeRecord? CloseOpenPosition(PortfolioState state, double exitPrice, DateTime closedAt)
@@ -1435,6 +2118,97 @@ internal sealed class PerformanceTracker
         state.Leverage = state.Leverage <= 0 ? _leverage : state.Leverage;
         state.History ??= new List<TradeRecord>();
         state.Statistics ??= new PerformanceStatistics();
+    }
+
+    private void InitializeDatabase()
+    {
+        var directory = Path.GetDirectoryName(_databasePath);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        using var connection = CreateConnection();
+        connection.Open();
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = @"
+CREATE TABLE IF NOT EXISTS portfolio_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    initial_balance REAL NOT NULL,
+    balance REAL NOT NULL,
+    leverage REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS statistics (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    realized_pnl REAL NOT NULL,
+    trades_won INTEGER NOT NULL,
+    trades_lost INTEGER NOT NULL,
+    trades_total INTEGER NOT NULL,
+    biggest_win REAL NOT NULL,
+    biggest_loss REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS open_position (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bias INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    quantity REAL NOT NULL,
+    margin REAL NOT NULL,
+    leverage REAL NOT NULL,
+    opened_at TEXT NOT NULL,
+    rationale TEXT
+);
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    opened_at TEXT NOT NULL,
+    closed_at TEXT NOT NULL,
+    bias INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    exit_price REAL NOT NULL,
+    quantity REAL NOT NULL,
+    margin REAL NOT NULL,
+    profit_loss REAL NOT NULL,
+    return_on_margin REAL NOT NULL,
+    liquidated INTEGER NOT NULL,
+    rationale TEXT
+);
+";
+            command.ExecuteNonQuery();
+        }
+
+        using (var countState = connection.CreateCommand())
+        {
+            countState.CommandText = "SELECT COUNT(*) FROM portfolio_state";
+            var count = (long)(countState.ExecuteScalar() ?? 0L);
+            if (count == 0)
+            {
+                using var insert = connection.CreateCommand();
+                insert.CommandText =
+                    "INSERT INTO portfolio_state (id, initial_balance, balance, leverage) VALUES (1, @initial, @initial, @leverage)";
+                insert.Parameters.AddWithValue("@initial", _initialBalance);
+                insert.Parameters.AddWithValue("@leverage", _leverage);
+                insert.ExecuteNonQuery();
+            }
+        }
+
+        using (var countStats = connection.CreateCommand())
+        {
+            countStats.CommandText = "SELECT COUNT(*) FROM statistics";
+            var count = (long)(countStats.ExecuteScalar() ?? 0L);
+            if (count == 0)
+            {
+                using var insertStats = connection.CreateCommand();
+                insertStats.CommandText =
+                    "INSERT INTO statistics (id, realized_pnl, trades_won, trades_lost, trades_total, biggest_win, biggest_loss) VALUES (1, 0, 0, 0, 0, 0, 0)";
+                insertStats.ExecuteNonQuery();
+            }
+        }
+    }
+
+    private SqliteConnection CreateConnection()
+    {
+        return new SqliteConnection(_connectionString);
     }
 }
 
